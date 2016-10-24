@@ -17,5 +17,6 @@
 
 (defsystem #:lockfree.tests
   :description "Unit test of lockfree data structures"
+  :depends-on (:portable-threads)
   :components
   ((:file "test-queue")))
