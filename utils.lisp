@@ -122,3 +122,22 @@ Atomic Stamp        (#b000000010110001100000000000000000000000000000000000000000
 
 (defmacro atomic-reference-neq (r1 r2)
   `(not (atomic-reference-equal ,r1 ,r2)))
+
+(defmacro decrement-and-test-and-set (place)
+  (let ((old (gensym))
+	(new (gensym)))
+    `(loop as ,old = ,place
+	   as ,new = (-f ,old 2)
+	   do
+       (when (=f 0 ,new)
+	 (setq ,new 1))
+	   until (compare-and-swap ,place ,old ,new)
+	   finally
+	     (return (logand (-f ,old ,new) 1)))))
+
+(defmacro clear-lowest-bit (place)
+  (let ((old (gensym))
+	(new (gensym)))
+    `(loop as ,old = ,place
+	   as ,new = (-f ,old 1)
+	   until (compare-and-swap ,place ,old ,new))))
