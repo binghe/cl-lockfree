@@ -10,13 +10,16 @@
   :version "1.0"
   :author "Chun Tian (binghe) <binghe.lisp@gmail.com>"
   :license "MIT"
+  :depends-on (:portable-threads)
   :components
   ((:file "package")
-   (:file "utils"       :depends-on ("package"))
-   (:file "queue"       :depends-on ("utils"))))
+   (:file "utilities"     :depends-on ("package"))
+   (:file "lockfree-list" :depends-on ("utilities"))))
 
 (defsystem #:cl-lockfree.tests
   :description "Unit test of lockfree data structures"
-  :depends-on (:portable-threads)
+  :depends-on (cl-lockfree)
   :components
-  ((:file "test-queue")))
+  ((:module "tests"
+    :components
+    ((:file "test-lockfree-list")))))
