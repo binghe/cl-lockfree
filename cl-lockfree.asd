@@ -5,7 +5,7 @@
 (in-package :asdf)
 
 (defsystem #:cl-lockfree
-  :description "A library of portable lock-free data structures in Common Lisp"
+  :description "A portable library of lock-free data structures"
   :version (:read-file-form "version.sexp")
   :author "Chun Tian (binghe)"
   :license "MIT"
@@ -19,6 +19,9 @@
 
 (defsystem #:cl-lockfree.tests
   :description "Unit test of lockfree data structures"
+  :version (:read-file-form "version.sexp")
+  :author "Chun Tian (binghe)"
+  :license "MIT"
   :depends-on (cl-lockfree)
   :components
   ((:module "tests"
