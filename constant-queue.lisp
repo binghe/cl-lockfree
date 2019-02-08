@@ -1,43 +1,52 @@
+;;;; Queues With Constant Insert, Dequeue, and Delete Operations
+
 (in-package :lockfree)
 
-(defmacro make-list-element-macro (queue-next-element queue-previous-element queue-datum)
-  `(vector 1 ,queue-next-element ,queue-previous-element ,queue-datum))
+;;; The following forms implement a type of queue which has constant time
+;;; insert, dequeue, and delete operations.
 
-(defun make-list-element (queue-next-element queue-previous-element queue-datum)
-  (make-list-element-macro queue-next-element queue-previous-element queue-datum))
+;;; The lock-free verion is based on algorithms from following papers:
+;;;
+;;; Sundell, Håkan. Efficient and practical non-blocking data structures.
+;;; Department of Computer Engineering, Chalmers University of Technology, 2004.
 
-(defmacro reclaim-list-element-macro (list-element)
-  (declare (ignore list-element))
-  nil) ; no-op
+;;; The structure `queue-element' is used to represent the elements of constant
+;;; queues.  They have next-element, previous-element, and datum slots.  Note
+;;; that these structures are declared to explicitly be of type vector, so as to
+;;; eliminate the name and save a word of memory per instance.  Note that this
+;;; means there is no predicate for this structure.
 
-(defmacro reclaim-list-element (list-element)
-  (reclaim-list-element-macro list-element))
+(def-structure (queue-element
+                 (:type vector)
+                 (:constructor make-queue-element
+                  (queue-next-element queue-previous-element queue-datum))
+                 ;; (:eliminate-for-products gsi)
+                 )
+  #+Lockfree-Deque
+  (reserved-slot-for-chaining nil)
+  #+Lockfree-Deque		    ; this cannot be the first slot which is also
+  (reference-count-and-claim-bit 1) ; used for chaining
+  ;; fix the literal number in `constant-queue-p' if more slots were added
+  queue-next-element		; also head
+  queue-previous-element	; also tail
+  queue-datum)			; also mark
 
-(defmacro reference-count-and-claim-bit (list-element)
-  `(svref ,list-element 0))
+(defmacro reference-count (queue-element)
+  `(ash (reference-count-and-claim-bit ,queue-element) -1))
 
-(defmacro queue-next-element (list-element)
-  `(svref ,list-element 1))
+(defmacro claim-bit (queue-element)
+  `(ldb (byte 1 0) (reference-count-and-claim-bit ,queue-element)))
 
-(defmacro queue-previous-element (list-element)
-  `(svref ,list-element 2))
+(defconstant constant-queue-marker '(constant-queue-marker))
 
-(defmacro queue-datum (list-element)
-  `(svref ,list-element 3))
-
-(defmacro reference-count (list-element)
-  `(ash (queue-reference-count-and-claim-bit ,list-element) -1))
-
-(defmacro claim-bit (list-element)
-  `(ldb (byte 1 0) (reference-count-and-claim-bit ,list-element)))
-
-(defconstant +lockfree-list-marker+ '(lockfree-list-marker))
-
-(defrun lockfree-list-p (thing)
+(def-substitution-macro constant-queue-p (thing)
   (and (simple-vector-p thing)
-       (=f (length (the simple-vector thing)) 4)
-       (eq (queue-datum thing) lockfree-list-marker)))
+       (=f (length (the simple-vector thing))
+	   #-Lockfree-Deque 3
+	   #+Lockfree-Deque 5)
+       (eq (queue-datum thing) constant-queue-marker)))
 
+#+Lockfree-Deque
 (defmacro safe-queue-read (place)
   (let ((q (gensym)))
     `(loop for ,q = ,place do
@@ -47,23 +56,26 @@
 	   (return ,q)
 	 (release-queue-node ,q)))))
 
+#+Lockfree-Deque
 (defmacro copy-queue-node (node-or-place) ; COPY_NODE
   `(safe-queue-read ,node-or-place))
 
-(defun read-queue-node (reference) ; READ_NODE
+#+Lockfree-Deque
+(defun-simple read-queue-node (reference) ; READ_NODE
   (multiple-value-bind (node mark)
       (get-atomic-reference reference)
     (unless mark
       (safe-queue-read node))))
 
-;; READ_DEL_NODE
-(defun read-deleted-queue-node (reference)
+#+Lockfree-Deque ; READ_DEL_NODE
+(defun-substitution-macro read-deleted-queue-node (reference)
   (let ((node (get-atomic-reference reference)))
     (safe-queue-read node)
     node))
 
-(defun create-list-element (thing)
-  (let ((node (make-list-element-macro nil nil nil)))			  ; C1
+#+Lockfree-Deque
+(defun-simple create-queue-element (thing)
+  (let ((node (make-queue-element-macro nil nil nil)))			  ; C1
     (setq node (safe-queue-read node))
     (clear-lowest-bit (reference-count-and-claim-bit node))
     (setf (queue-datum node) thing)					  ; C2
@@ -72,43 +84,76 @@
 (defun release-queue-node (node)
   (when (null node)
     (return-from release-queue-node))
+  #+Lockfree-Deque
   (when (=f 0 (decrement-and-test-and-set (reference-count-and-claim-bit node)))
     (return-from release-queue-node))
+  #+Lockfree-Deque
   (release-reference node)
-  (reclaim-list-element-macro node))
+  (reclaim-queue-element-macro node))
 
-(defconstant lockfree-list-head-marker '(lockfree-list-head-marker))
-(defconstant lockfree-list-tail-marker '(lockfree-list-tail-marker))
+;;; The function `make-empty-constant-queue' returns a new, empty constant
+;;; queue.  Constant queues are represented with a queue-element, where the head
+;;; of the queue is stored in the next-element slot, the tail of the queue is
+;;; stored in the previous-element slot, and the datum slot contains the
+;;; constant-queue-head marker.  Empty constant queues contain pointers back to
+;;; the queue element in the head and tail slots.
 
-(defmacro queue-next-element-real (list-element)
+#+Lockfree-Deque
+(defconstant constant-queue-head-marker '(constant-queue-head-marker))
+#+Lockfree-Deque
+(defconstant constant-queue-tail-marker '(constant-queue-tail-marker))
+
+(defmacro queue-next-element-real (queue-element)
   `(atomic-reference-object
-     (queue-next-element ,list-element)))
+     (queue-next-element ,queue-element)))
 
-(defmacro queue-previous-element-real (list-element)
+(defmacro queue-previous-element-real (queue-element)
   `(atomic-reference-object
-     (queue-previous-element ,list-element)))
+     (queue-previous-element ,queue-element)))
 
-(defmacro lockfree-list-head (list-element)
-  `(queue-next-element ,list-element))
+#+Lockfree-Deque
+(defun release-reference (node)
+  (release-queue-node (queue-previous-element-real node))		  ; RR1
+  (release-queue-node (queue-next-element-real node)))			  ; RR2
 
-(defmacro lockfree-list-tail (list-element)
-  `(queue-previous-element ,list-element))
+(defmacro constant-queue-head (constant-queue)
+  `(queue-next-element ,constant-queue))
 
-(defun make-empty-lockfree-list ()
-  (let ((new-queue (make-list-element-macro
-		     nil nil lockfree-list-marker))
-	(head (make-list-element-macro
-		nil (make-atomic-reference nil) lockfree-list-head-marker))
-	(tail (make-list-element-macro
-		(make-atomic-reference nil) nil lockfree-list-tail-marker)))
+(defmacro constant-queue-tail (constant-queue)
+  `(queue-previous-element ,constant-queue))
+
+(def-substitution-macro constant-queue-head-if (constant-queue)
+  (when constant-queue
+    (constant-queue-head constant-queue)))
+
+(def-substitution-macro constant-queue-tail-if (constant-queue)
+  (when constant-queue
+    (constant-queue-tail constant-queue)))
+
+#-Lockfree-Deque
+(defun-simple make-empty-constant-queue ()
+  (let ((new-queue (make-queue-element-macro
+                     nil nil constant-queue-marker)))
+    (setf (constant-queue-head new-queue) new-queue)
+    (setf (constant-queue-tail new-queue) new-queue)
+    new-queue))
+
+#+Lockfree-Deque
+(defun-simple make-empty-constant-queue ()
+  (let ((new-queue (make-queue-element-macro
+		     nil nil constant-queue-marker))
+	(head (make-queue-element-macro
+		nil (make-atomic-reference nil) constant-queue-head-marker))
+	(tail (make-queue-element-macro
+		(make-atomic-reference nil) nil constant-queue-tail-marker)))
     (setq head (safe-queue-read head)
 	  tail (safe-queue-read tail))
     (clear-lowest-bit (reference-count-and-claim-bit head))
     (clear-lowest-bit (reference-count-and-claim-bit tail))
     (setf (queue-next-element head) (make-atomic-reference tail))
     (setf (queue-previous-element tail) (make-atomic-reference head))
-    (setf (lockfree-list-head new-queue) head)
-    (setf (lockfree-list-tail new-queue) tail)
+    (setf (constant-queue-head new-queue) head)
+    (setf (constant-queue-tail new-queue) tail)
     new-queue))
 
 ;;; The `Next' function tries to change the cursor to the next position
@@ -140,6 +185,12 @@
 ;;; actual position is then interpreted to be at an imaginary node directly
 ;;; previous of the representing node.
 
+#-Lockfree-Deque
+(defmacro constant-queue-next (cursor constant-queue)
+  (declare (ignore constant-queue))
+  `(queue-next-element ,cursor))
+
+#+(or Lockfree-Deque Lockfree-List)
 (defmacro generate-*-next ((cursor container)
 			   tail-element
 			   next-element
@@ -167,9 +218,10 @@
 			   (neq next tail))
 		  (return ,cursor))))))))				  ; NT11
 
-(defun lockfree-list-next (cursor lockfree-list)
-  (generate-*-next (cursor lockfree-list)
-    lockfree-list-tail
+#+Lockfree-Deque
+(defun-simple constant-queue-next (cursor constant-queue)
+  (generate-*-next (cursor constant-queue)
+    constant-queue-tail
     queue-next-element
     read-deleted-queue-node
     release-queue-node
@@ -195,6 +247,12 @@
 ;;; dummy node, and the read sub-operation of the prev pointer in line PV3
 ;;; otherwise.
 
+#-Lockfree-Deque
+(defmacro constant-queue-previous (cursor constant-queue)
+  (declare (ignore constant-queue))
+  `(queue-previous-element ,cursor))
+
+#+(or Lockfree-Deque Lockfree-List)
 (defmacro generate-*-previous ((cursor structure)
 			       head-element
 			       next-element
@@ -224,15 +282,16 @@
 		(setq prev (,help-insert prev ,cursor))			  ; PV10
 		(,release-node prev)))))))				  ; PV11
 
-(defun lockfree-list-previous (cursor lockfree-list)
-  (generate-*-previous (cursor lockfree-list)
-    lockfree-list-head
+#+Lockfree-Deque
+(defun constant-queue-previous (cursor constant-queue)
+  (generate-*-previous (cursor constant-queue)
+    constant-queue-head
     queue-next-element
     queue-previous-element
     read-deleted-queue-node
     release-queue-node
     help-insert-queue-node
-    lockfree-list-next))
+    constant-queue-next))
 
 ;;; The `Read' function returns the current value of the node referenced by
 ;;; the cursor, unless this node is deleted or the node is equal to any of
@@ -248,70 +307,149 @@
 ;;; positioned by the cursor was the head or tail dummy node when the
 ;;; linearizability point is line RD1.
 
-(defun lockfree-list-read (cursor &optional lockfree-list)
-  (if (or (eq cursor (lockfree-list-head-if lockfree-list))		  ; RD1
-	  (eq cursor (lockfree-list-tail-if lockfree-list)))
+#+Lockfree-Deque
+(defun constant-queue-read (cursor &optional constant-queue)
+  (if (or (eq cursor (constant-queue-head-if constant-queue))		  ; RD1
+	  (eq cursor (constant-queue-tail-if constant-queue)))
       nil
     (let ((value (queue-datum cursor)))					  ; RD2
       (if (atomic-reference-mark (queue-next-element cursor))		  ; RD3
 	  nil
 	value))))							  ; RD4
 
-(defun clear-lockfree-list (lockfree-list)
-  (let ((head (lockfree-list-head lockfree-list))
-        (tail (lockfree-list-tail lockfree-list)))
+#-Lockfree-Deque
+(defun constant-queue-read (cursor &optional constant-queue)
+  (declare (ignore constant-queue))
+  (let ((value (queue-datum cursor)))
+    value))
+
+#-Lockfree-Deque
+(defun-simple clear-constant-queue (constant-queue)
+  (declare (eliminate-for-gsi))
+  (loop for element = (constant-queue-head constant-queue)
+                    then (prog1 (queue-next-element element)
+                                (reclaim-queue-element-macro element))
+        until (eq element constant-queue))
+  (setf (constant-queue-head constant-queue) constant-queue)
+  (setf (constant-queue-tail constant-queue) constant-queue)
+  constant-queue)
+
+#+Lockfree-Deque
+(defun-simple clear-constant-queue (constant-queue)
+  (declare (eliminate-for-gsi))
+  (let ((head (constant-queue-head constant-queue))
+        (tail (constant-queue-tail constant-queue)))
     (loop with next-element-structure = nil
 	  for element-structure = (queue-next-element-real head)
 	                        then next-element-structure
 	  until (eq element-structure tail)
 	  do
       (setf next-element-structure (queue-next-element-real element-structure))
-      (reclaim-list-element-macro element-structure))
+      (reclaim-queue-element-macro element-structure))
     (setf (queue-next-element head)
           (make-atomic-reference tail))
     (setf (queue-previous-element tail)
           (make-atomic-reference head))
-    lockfree-list))
+    constant-queue))
 
-(defun reclaim-lockfree-list (lockfree-list)
-  (let ((head (lockfree-list-head lockfree-list))
-        (tail (lockfree-list-tail lockfree-list)))
-    (loop for element = head
-                   then (prog1 (queue-next-element-real element)
-                          (reclaim-list-element-macro element))
-          until (eq element tail)
-          finally (reclaim-list-element-macro element)))
-  (setf (queue-datum lockfree-list) nil)
-  (reclaim-list-element-macro lockfree-list)
+#-Lockfree-Deque
+(defun-simple reclaim-constant-queue (constant-queue)
+  (loop for element = (constant-queue-head constant-queue)
+                    then (prog1 (queue-next-element element)
+                                #+development
+                                (setf (queue-next-element element) nil)
+                                (reclaim-queue-element-macro element))
+        until (eq element constant-queue))
+  (setf (queue-datum constant-queue) nil)
+  (reclaim-queue-element-macro constant-queue)
   nil)
 
-(defmacro lockfree-list-peek (lockfree-list &optional (default-value nil))
-  (let ((queue-var (if (symbolp lockfree-list)
-		       lockfree-list
+#+Lockfree-Deque
+(defun-simple reclaim-constant-queue (constant-queue)
+  (let ((head (constant-queue-head constant-queue))
+        (tail (constant-queue-tail constant-queue)))
+    (loop for element = head
+                   then (prog1 (queue-next-element-real element)
+                          (reclaim-queue-element-macro element))
+          until (eq element tail)
+          finally (reclaim-queue-element-macro element)))
+  (setf (queue-datum constant-queue) nil)
+  (reclaim-queue-element-macro constant-queue)
+  nil)
+
+#+development
+(def-development-printer print-constant-queue (queue stream)
+  (when (constant-queue-p queue)
+    (printing-random-object (queue stream)
+      (format stream "CONSTANT-QUEUE"))
+    queue))
+
+;;; The macro `constant-queue-peek' takes a constant queue and returns the
+;;; next item to be dequeued.
+
+#-Lockfree-Deque
+(defmacro constant-queue-peek (constant-queue &optional (default-value nil))
+  (let ((queue-var (if (symbolp constant-queue) constant-queue (gensym)))
+        (first-entry (gensym)))
+    `(let* (,@(if (neq queue-var constant-queue)
+                  `((,queue-var ,constant-queue)))
+            (,first-entry (constant-queue-head ,queue-var)))
+       (if (neq ,first-entry ,queue-var)
+           (queue-datum ,first-entry)
+         ,default-value))))
+
+#+Lockfree-Deque
+(defmacro constant-queue-peek (constant-queue &optional (default-value nil))
+  (let ((queue-var (if (symbolp constant-queue)
+		       constant-queue
 		     (make-symbol "QUEUE")))
 	(head (make-symbol "HEAD"))
 	(first (make-symbol "FIRST")))
-    `(let* (,@(if (neq queue-var lockfree-list)
-		  `((,queue-var ,lockfree-list)))
-	    (,head (lockfree-list-head ,queue-var))
-	    (,first (lockfree-list-next ,head ,queue-var)))
+    `(let* (,@(if (neq queue-var constant-queue)
+		  `((,queue-var ,constant-queue)))
+	    (,head (constant-queue-head ,queue-var))
+	    (,first (constant-queue-next ,head ,queue-var)))
        (if ,first
-	   (lockfree-list-read ,first ,queue-var)
-         ,default-value))))
+	   (constant-queue-read ,first ,queue-var)
+	 ,default-value))))
 
-;;; The substitution macro `lockfree-list-empty-p' returns whether or not the
+;;; The substitution macro `constant-queue-empty-p' returns whether or not the
 ;;; queue is empty.  If you want the datum of the first queue entry, call
-;;; lockfree-list-peek.
+;;; constant-queue-peek.
 
-(def-substitution-macro lockfree-list-empty-p (lockfree-list)
+(def-substitution-macro constant-queue-empty-p (constant-queue)
   #-Lockfree-Deque
-  (eq (lockfree-list-head lockfree-list) lockfree-list)
+  (eq (constant-queue-head constant-queue) constant-queue)
   #+Lockfree-Deque
-  (null (lockfree-list-next
-          (lockfree-list-head lockfree-list) lockfree-list)))
+  (null (constant-queue-next
+	  (constant-queue-head constant-queue) constant-queue)))
 
-(def-substitution-macro lockfree-list-non-empty-p (lockfree-list)
-  (not (lockfree-list-empty-p lockfree-list)))
+(def-substitution-macro constant-queue-non-empty-p (constant-queue)
+  (not (constant-queue-empty-p constant-queue)))
+
+;;; The macro `constant-queue-enqueue' takes a constant queue and a thing to
+;;; be enqueued, and enqueues that item in the queue for FIFO dequeuing.  This
+;;; function returns the new entry for the given thing in the queue.
+
+;;; Since the head and tail pointers of an empty queue point back to the queue
+;;; itself, we do not need to check for the empty queue in this enqueuing
+;;; operation.  This is true since setting the "next-element" of the "tail"
+;;; actually sets the head pointer of the queue in the empty queue case.
+
+#-Lockfree-Deque
+(defmacro constant-queue-enqueue (constant-queue thing)
+  (let* ((queue-var (if (symbolp constant-queue)
+                        constant-queue
+                        (gensym)))
+         (tail (gensym))
+         (new-element (gensym)))
+    `(let* (,@(if (neq queue-var constant-queue)
+                  `((,queue-var ,constant-queue)))
+            (,tail (constant-queue-tail ,queue-var))
+            (,new-element (make-queue-element-macro ,queue-var ,tail ,thing)))
+       (setf (queue-next-element ,tail) ,new-element)
+       (setf (constant-queue-tail ,queue-var) ,new-element)
+       ,new-element)))
 
 ;;; The PushRight operation inserts a new node at the rightmost position in the
 ;;; deque. The algorithm first repeatedly tries in lines R4-R13 to insert the
@@ -354,7 +492,7 @@
      (,release-node ,node)))						  ; P15
 
 #+Lockfree-Deque
-(defun-void lockfree-list-push-common (node next)
+(defun-void constant-queue-push-common (node next)
   (generate-*-push-common (node next)
     queue-previous-element
     queue-next-element
@@ -397,20 +535,38 @@
        node)))
 
 #+Lockfree-Deque
-(defun-simple lockfree-list-push-right (lockfree-list thing)
-  (generate-*-push-right (lockfree-list
-			  lockfree-list-tail
+(defun-simple constant-queue-push-right (constant-queue thing)
+  (generate-*-push-right (constant-queue
+			  constant-queue-tail
 			  queue-previous-element
 			  queue-next-element
 			  copy-queue-node
 			  read-queue-node
 			  help-insert-queue-node
-			  lockfree-list-push-common)
-    (create-list-element thing)))
+			  constant-queue-push-common)
+    (create-queue-element thing)))
 
 #+Lockfree-Deque
-(defmacro lockfree-list-enqueue (lockfree-list thing)
-  `(lockfree-list-push-right ,lockfree-list ,thing))
+(defmacro constant-queue-enqueue (constant-queue thing)
+  `(constant-queue-push-right ,constant-queue ,thing))
+
+;;; The function `constant-queue-filo-enqueue' takes a constant queue and a
+;;; thing to be enqueued, and enqueues that item in the queue for FILO
+;;; dequeueing.  This function returns the new entry for the given thing in the
+;;; queue.
+
+#-Lockfree-Deque
+(defmacro constant-queue-filo-enqueue (constant-queue thing)
+  (let* ((queue-var (if (symbolp constant-queue) constant-queue (gensym)))
+         (head (gensym))
+         (new-element (gensym)))
+    `(let* (,@(if (neq queue-var constant-queue)
+                  `((,queue-var ,constant-queue)))
+            (,head (constant-queue-head ,queue-var))
+            (,new-element (make-queue-element-macro ,head ,queue-var ,thing)))
+       (setf (constant-queue-head ,queue-var) ,new-element)
+       (setf (queue-previous-element ,head) ,new-element)
+       ,new-element)))
 
 ;;; The PushLeft operation inserts a new node at the leftmost position in the
 ;;; deque. The algorithm first repeatedly tries in lines L4-L14 to insert the
@@ -466,20 +622,46 @@
        node)))
 
 #+Lockfree-Deque
-(defun-simple lockfree-list-push-left (lockfree-list thing)
-  (generate-*-push-left (lockfree-list
-			 lockfree-list-head
+(defun-simple constant-queue-push-left (constant-queue thing)
+  (generate-*-push-left (constant-queue
+			 constant-queue-head
 			 queue-previous-element
 			 queue-next-element
 			 copy-queue-node
 			 read-queue-node
 			 release-queue-node
-			 lockfree-list-push-common)
-    (create-list-element thing)))
+			 constant-queue-push-common)
+    (create-queue-element thing)))
 
 #+Lockfree-Deque
-(defmacro lockfree-list-filo-enqueue (lockfree-list thing)
-  `(lockfree-list-push-left ,lockfree-list ,thing))
+(defmacro constant-queue-filo-enqueue (constant-queue thing)
+  `(constant-queue-push-left ,constant-queue ,thing))
+
+;;; The macro `constant-queue-dequeue' takes a constant queue and an optional
+;;; value to return if the queue is empty.  It dequeues and returns the first
+;;; element of the queue, or returns the given value if the queue is empty.
+;;; Note that this is a NON-STANDARD MACRO in that the default value will only
+;;; be evaluated if the queue is empty.
+
+#-Lockfree-Deque
+(defmacro constant-queue-dequeue (constant-queue &optional (default-value nil))
+  (let ((queue-var (if (symbolp constant-queue)
+                       constant-queue
+                       (gensym)))
+        (head (gensym))
+        (datum (gensym))
+        (new-head (gensym)))
+    `(let* (,@(if (neq queue-var constant-queue)
+                  `((,queue-var ,constant-queue)))
+            (,head (constant-queue-head ,queue-var)))
+       (if (eq ,head ,queue-var)
+           (values ,default-value nil)
+           (let ((,datum (queue-datum ,head))
+                 (,new-head (queue-next-element ,head)))
+             (setf (constant-queue-head ,queue-var) ,new-head)
+             (setf (queue-previous-element ,new-head) ,queue-var)
+             (reclaim-queue-element-macro ,head)
+             (values ,datum t))))))
 
 ;;; The PopLeft operation tries to delete and return the value of the leftmost
 ;;; node in the deque. The algorithm first repeatedly tries in lines PL2-PL22 to
@@ -498,9 +680,9 @@
 ;;; RemoveCrossReference function.
 
 #+Lockfree-Deque
-(defun lockfree-list-pop-left (lockfree-list &optional default-value)
-  (let ((prev (copy-queue-node (lockfree-list-head lockfree-list)))	  ; PL1
-	(tail (lockfree-list-tail lockfree-list))
+(defun constant-queue-pop-left (constant-queue &optional default-value)
+  (let ((prev (copy-queue-node (constant-queue-head constant-queue)))	  ; PL1
+	(tail (constant-queue-tail constant-queue))
 	(node nil)
 	(return-value default-value)
 	(backoff-limit backoff-min-delay))
@@ -509,7 +691,7 @@
       (when (eq node tail)						  ; PL4
 	(release-queue-node node)					  ; PL5
 	(release-queue-node prev)					  ; PL6
-	(return-from lockfree-list-pop-left
+	(return-from constant-queue-pop-left
 	  (values default-value nil)))					  ; PL7
       (let ((link1 (queue-next-element node)))				  ; PL8
 	(cond
@@ -537,8 +719,8 @@
     (values return-value t)))						  ; PL25
 
 #+Lockfree-Deque
-(defmacro lockfree-list-dequeue (lockfree-list &optional (default-value nil))
-  `(lockfree-list-pop-left ,lockfree-list ,default-value))
+(defmacro constant-queue-dequeue (constant-queue &optional (default-value nil))
+  `(constant-queue-pop-left ,constant-queue ,default-value))
 
 ;;; The PopRight operation tries to delete and return the value of the rightmost
 ;;; node in the deque. The algorithm first repeatedly tries in lines PR2-PR19 to
@@ -553,8 +735,8 @@
 ;;; marked it follows the same scheme as the PopLeft operation.
 
 #+Lockfree-Deque
-(defun lockfree-list-pop-right (lockfree-list &optional default-value)
-  (let* ((next (copy-queue-node (lockfree-list-tail lockfree-list)))	  ; PR1
+(defun constant-queue-pop-right (constant-queue &optional default-value)
+  (let* ((next (copy-queue-node (constant-queue-tail constant-queue)))	  ; PR1
 	 (node (read-queue-node (queue-previous-element next)))		  ; PR2
 	 (return-value default-value)
 	 (backoff-limit backoff-min-delay))
@@ -564,10 +746,10 @@
 			       (make-atomic-reference next nil))	  ; PR4
 	 (setq node (help-insert-queue-node node next)))		  ; PR5
 	(t								  ; PR6
-	 (when (eq node (lockfree-list-head lockfree-list))		  ; PR7
+	 (when (eq node (constant-queue-head constant-queue))		  ; PR7
 	   (release-queue-node node)					  ; PR8
 	   (release-queue-node next)					  ; PR9
-	   (return-from lockfree-list-pop-right
+	   (return-from constant-queue-pop-right
 	     (values default-value nil)))				  ; PR10
 	 (when (compare-and-swap (queue-next-element node)
 				 (make-atomic-reference next nil)
@@ -587,9 +769,8 @@
     (values return-value t)))						  ; PR22
 
 #+Lockfree-Deque
-(defmacro lockfree-list-filo-dequeue (lockfree-list &optional (default-value nil))
-  `(lockfree-list-pop-right ,lockfree-list ,default-value))
-
+(defmacro constant-queue-filo-dequeue (constant-queue &optional (default-value nil))
+  `(constant-queue-pop-right ,constant-queue ,default-value))
 
 ;;; Helping and Back-Off
 
@@ -757,6 +938,7 @@
     copy-queue-node
     release-queue-node
     help-delete-queue-node))
+
 ;;; The RemoveCrossReference sub-procedure tries to break cross-references
 ;;; between the given node (node) and any of the nodes that it references, by
 ;;; repeatedly updating the prev and next pointer as long as they reference a
@@ -872,18 +1054,37 @@
        node)))
 
 #+Lockfree-Deque
-(defun-simple lockfree-list-insert-before (lockfree-list cursor thing)
-  (generate-*-insert-before (lockfree-list-insert-before lockfree-list cursor
-			     lockfree-list-head
-			     lockfree-list-next
+(defun-simple constant-queue-insert-before (constant-queue cursor thing)
+  (generate-*-insert-before (constant-queue-insert-before constant-queue cursor
+			     constant-queue-head
+			     constant-queue-next
 			     queue-previous-element
 			     queue-next-element
 			     read-deleted-queue-node
 			     copy-queue-node
 			     release-queue-node
 			     help-insert-queue-node)
-    (create-list-element thing)
-    (lockfree-list-insert-after lockfree-list cursor thing)))
+    (create-queue-element thing)
+    (constant-queue-insert-after constant-queue cursor thing)))
+
+#-Lockfree-Deque
+(defmacro constant-queue-insert-before (constant-queue cursor thing)
+  (let* ((queue-var (if (symbolp constant-queue)
+			constant-queue
+		        (gensym)))
+         (head (gensym))
+         (new-element (gensym)))
+    `(let* (,@(if (neq queue-var constant-queue)
+                  `((,queue-var ,constant-queue))))
+       (if (eq ,cursor ,queue-var)
+	   (constant-queue-enqueue ,queue-var ,thing)
+	 (let* ((,head (queue-previous-element ,cursor))
+		(,new-element (make-queue-element-macro ,cursor ,head ,thing)))
+	   (setf (queue-previous-element ,cursor) ,new-element)
+	   (if (eq ,head ,queue-var) ; cursor is head
+	       (setf (constant-queue-head ,queue-var) ,new-element)
+	     (setf (queue-next-element ,head) ,new-element))
+	   ,new-element)))))
 
 ;;; The `InsertAfter' operation inserts a new node directly after the node
 ;;; positioned by the given cursor and later changes the cursor to position
@@ -951,18 +1152,107 @@
 
 
 #+Lockfree-Deque
-(defun-simple lockfree-list-insert-after (lockfree-list cursor thing)
-  (generate-*-insert-after (lockfree-list-insert-after lockfree-list cursor
-			    lockfree-list-tail
+(defun-simple constant-queue-insert-after (constant-queue cursor thing)
+  (generate-*-insert-after (constant-queue-insert-after constant-queue cursor
+			    constant-queue-tail
 			    queue-previous-element
 			    queue-next-element
 			    read-deleted-queue-node
 			    copy-queue-node
 			    release-queue-node
 			    help-insert-queue-node)
-    (create-list-element thing)
-    (lockfree-list-insert-before lockfree-list cursor thing)))
+    (create-queue-element thing)
+    (constant-queue-insert-before constant-queue cursor thing)))
 
+#-Lockfree-Deque
+(defmacro constant-queue-insert-after (constant-queue cursor thing)
+  (let* ((queue-var (if (symbolp constant-queue)
+                        constant-queue
+                        (gensym)))
+	 (tail (gensym))
+         (new-element (gensym)))
+    `(let* (,@(if (neq queue-var constant-queue)
+                  `((,queue-var ,constant-queue))))
+       (if (eq ,cursor ,queue-var)
+	   (constant-queue-filo-enqueue ,queue-var ,thing)
+	 (let* ((,tail (queue-next-element ,cursor))
+		(,new-element (make-queue-element-macro ,tail ,cursor ,thing)))
+	   (setf (queue-next-element ,cursor) ,new-element)
+	   (if (eq ,tail ,queue-var) ; cursor is tail
+	       (setf (constant-queue-tail ,queue-var) ,new-element)
+	     (setf (queue-previous-element ,tail) ,new-element))
+	   ,new-element)))))
+
+;;; The substitution macro `requeue-queue-element' takes a constant-queue and a
+;;; queue-element.  The queue-element is removed from its current constant-queue
+;;; and enqueued onto the end of the given constant-queue.  Note that the given
+;;; constant-queue can either be the current queue for this queue-element, or it
+;;; can be an entirely different constant queue.
+
+#-Lockfree-Deque
+(def-substitution-macro requeue-queue-element (constant-queue queue-element)
+  (let ((old-next-element (queue-next-element queue-element))
+        (old-previous-element (queue-previous-element queue-element)))
+    (setf (queue-previous-element old-next-element) old-previous-element)
+    (setf (queue-next-element old-previous-element) old-next-element))
+  (let ((old-tail (constant-queue-tail constant-queue)))
+    (setf (queue-next-element queue-element) constant-queue)
+    (setf (queue-previous-element queue-element) old-tail)
+    (setf (queue-next-element old-tail) queue-element)
+    (setf (constant-queue-tail constant-queue) queue-element))
+  nil)
+
+;;; The substitution macro `merge-constant-queues' takes two constants queues,
+;;; and appends the tasks from the second constant queue onto the end of the
+;;; queue of tasks stored in the first constant queue.  After this macro, the
+;;; second constant queue will always be empty.
+
+#-Lockfree-Deque
+(def-substitution-macro merge-constant-queues (queue-to-fill queue-to-empty)
+  (unless (constant-queue-empty-p queue-to-empty)
+    (let ((head (constant-queue-head queue-to-empty))
+          (tail (constant-queue-tail queue-to-empty)))
+      (setf (constant-queue-head queue-to-empty) queue-to-empty)
+      (setf (constant-queue-tail queue-to-empty) queue-to-empty)
+      (cond ((constant-queue-empty-p queue-to-fill)
+             (setf (constant-queue-head queue-to-fill) head)
+             (setf (constant-queue-tail queue-to-fill) tail)
+             (setf (queue-previous-element head) queue-to-fill)
+             (setf (queue-next-element tail) queue-to-fill))
+            (t
+             (let ((old-tail (constant-queue-tail queue-to-fill)))
+               (setf (queue-next-element old-tail) head)
+               (setf (queue-previous-element head) old-tail)
+               (setf (constant-queue-tail queue-to-fill) tail)
+               (setf (queue-next-element tail) queue-to-fill))))))
+  #+development
+  (unless (constant-queue-empty-p queue-to-empty)
+    (error "constant queue not empty?!"))
+  nil)
+
+;;; The macro `delete-queue-element' takes a constant queue element and deletes
+;;; it from its constant queue.  It also reclaims the given element.
+
+#-Lockfree-Deque
+(defmacro delete-queue-element (constant-queue-element)
+  (let* ((element-var (if (symbolp constant-queue-element)
+                          constant-queue-element
+                          (gensym)))
+         (next (gensym))
+         (previous (gensym)))
+    `(let* (,@(if (neq element-var constant-queue-element)
+                  `((,element-var ,constant-queue-element)))
+            (,next (queue-next-element ,element-var))
+            (,previous (queue-previous-element ,element-var)))
+       (setf (queue-next-element ,previous) ,next)
+       (setf (queue-previous-element ,next) ,previous)
+       (prog1 (queue-datum ,element-var)
+	 (reclaim-queue-element-macro ,element-var)))))
+
+#-Lockfree-Deque
+(defmacro constant-queue-delete (queue-element constant-queue)
+  (declare (ignore constant-queue))
+  `(delete-queue-element ,queue-element))
 
 ;;; The `Delete' operation tries to delete the non-dummy node referenced by
 ;;; the given cursor and returns the value if successful, otherwise a non-
@@ -1021,10 +1311,10 @@
 	     (return (values value t))))))))				  ; D12
 
 #+Lockfree-Deque
-(defun lockfree-list-delete (cursor &optional lockfree-list)
-  (generate-*-delete (cursor lockfree-list)
-		     lockfree-list-head
-		     lockfree-list-tail
+(defun constant-queue-delete (cursor &optional constant-queue)
+  (generate-*-delete (cursor constant-queue)
+		     constant-queue-head
+		     constant-queue-tail
 		     queue-next-element
 		     queue-previous-element
 		     copy-queue-node
@@ -1033,4 +1323,164 @@
 		     help-insert-queue-node
 		     queue-datum
 		     remove-queue-cross-reference
-		     lockfree-list-delete))
+		     constant-queue-delete))
+
+#+Lockfree-Deque
+(defmacro delete-queue-element (constant-queue-element)
+  `(constant-queue-delete ,constant-queue-element))
+
+;; find the first matched datum and delete it from constant-queue
+(defun-void constant-queue-search-and-delete (constant-queue datum)
+  (loop with head = (constant-queue-head constant-queue)
+	for queue-element = #-Lockfree-Deque head
+			    #+Lockfree-Deque (constant-queue-next head constant-queue)
+		       then (constant-queue-next queue-element constant-queue)
+	until #-Lockfree-Deque (eq queue-element constant-queue)
+	      #+Lockfree-Deque (null queue-element)
+	when (eq datum (queue-datum queue-element))
+	  do (constant-queue-delete queue-element constant-queue)
+	     (loop-finish)))
+
+;; find all matched data and delete them from constant queue
+(defun-void constant-queue-search-and-delete-all (constant-queue datum)
+  (loop with head = (constant-queue-head constant-queue)
+	for queue-element = #-Lockfree-Deque head
+			    #+Lockfree-Deque (constant-queue-next head constant-queue)
+		       then next-queue-element
+	until #-Lockfree-Deque (eq queue-element constant-queue)
+	      #+Lockfree-Deque (null queue-element)
+	for next-queue-element = (constant-queue-next queue-element constant-queue)
+	when (eq datum (queue-datum queue-element))
+	  do (constant-queue-delete queue-element constant-queue)))
+
+#+Lockfree-Deque
+(defun requeue-queue-element (constant-queue queue-element element-queue)
+  (let ((value (queue-datum queue-element)))
+    (constant-queue-delete queue-element element-queue)
+    (constant-queue-enqueue constant-queue value))
+  nil)
+
+;;; The development function `check-constant-queue-ok' takes a constant queue
+;;; and checks that it's elements are in a circular list and that they become
+;;; circular within fewer than `constant-queue-check-limit' elements.
+
+#+development
+(defconstant constant-queue-check-limit 131072) ; increased for HTWOS
+
+;;; The loop path `constant-queue-element' is used to iterate over all
+;;; constant-queue-elements within a constant queue.  During this iteration it
+;;; is OK to call delete-queue-element on the current queue element given by the
+;;; iteration, but any other modifications to the constant-queue being iterated
+;;; have undefined effect.
+
+(define-loop-path (constant-queue-element) constant-queue-elements-of (of))
+
+(defun-for-macro constant-queue-elements-of
+    (path-name variable data-type prep-phrases inclusive?
+               allowed-preposistions data)
+  (declare (ignore data-type data allowed-preposistions))
+  (when (null prep-phrases)
+    (error "OF is missing in ~S iteration path of ~S."
+           path-name variable))
+  (when inclusive?
+    (error "Inclusive stepping is not supported in ~s path of ~s ~
+            (prep-phrase = ~s)"
+           path-name variable prep-phrases))
+  (let* ((queue (make-symbol "QUEUE"))
+         (next-queue-element (make-symbol "NEXT-QUEUE-ELEMENT"))
+         (init-bindings
+           `((,queue ,(second (car prep-phrases)))
+             (,next-queue-element nil)
+             (,variable nil)))
+         (prologue-forms
+           `((setq ,next-queue-element
+                   #-Lockfree-Deque (constant-queue-head ,queue)
+                   #+Lockfree-Deque (constant-queue-next
+                                      (constant-queue-head ,queue) ,queue))))
+         (pre-step-tests
+	   #-Lockfree-Deque
+	   `(eq ,next-queue-element ,queue)
+	   #+Lockfree-Deque
+           `(null ,next-queue-element))
+         (steppings nil)
+         (post-step-tests nil)
+         (post-step-settings
+           `(,variable (queue-datum ,next-queue-element)
+             ,next-queue-element
+             (constant-queue-next ,next-queue-element ,queue))))
+    `(,init-bindings
+      ,prologue-forms
+      ,pre-step-tests
+      ,steppings
+      ,post-step-tests
+      ,post-step-settings)))
+
+
+;;; The development function `constant-queue-elements' returns a list of
+;;; the values queued in the given constant queue.
+
+#+development
+(defun constant-queue-elements (constant-queue)
+  (loop for element being each constant-queue-element of constant-queue
+        collect element))
+
+(defun constant-queue-length (constant-queue)
+  (if (null constant-queue)
+      0
+    (loop for element being each constant-queue-element of constant-queue
+	  count element)))
+
+#+development
+(defun describe-constant-queue (constant-queue)
+  "Display all queue elements in a constant queue (with head and tail), then ~
+return the number of elements (not include head and tail)."
+  (flet ((print-one (element)
+	   #-Lockfree-Deque
+	   (format t "~A: next: ~A, prev: ~A, data: ~A~%"
+		   (%pointer element)
+		   (queue-next-element element)
+		   (queue-previous-element element)
+		   (queue-datum element))
+	   #+Lockfree-Deque
+	   (format t "~A: next: ~A, prev: ~A, data: ~A, ref-count: ~D (claim-bit: ~D)~%"
+		   (%pointer element)
+		   (queue-next-element element)
+		   (queue-previous-element element)
+		   (queue-datum element)
+		   (reference-count element)
+		   (claim-bit element))))
+    (let ((element-list nil)
+	  (head (constant-queue-head constant-queue))
+	  #+Lockfree-Deque
+	  (tail (constant-queue-tail constant-queue)))
+      (loop for element = #-Lockfree-Deque head
+			  #+Lockfree-Deque (queue-next-element-real head)
+			then (queue-next-element-real element)
+			until #-Lockfree-Deque (eq element constant-queue)
+			      #+Lockfree-Deque (eq element tail)
+	    initially
+	      #-Lockfree-Deque ()
+	      #+Lockfree-Deque (print-one head)
+	    do
+	(print-one element)
+	(push element element-list)
+	    finally
+	      #+Lockfree-Deque (print-one tail)
+	      (return (nreverse element-list))))))
+
+;; reverse the elements and reclaim the argument
+(defun-simple constant-queue-nreverse (constant-queue)
+  (let ((new-constant-queue
+	 (make-empty-constant-queue)))
+    (loop for block being each constant-queue-element of constant-queue
+	  do
+      (constant-queue-filo-enqueue new-constant-queue block) ; push-left
+          finally
+	    (reclaim-constant-queue constant-queue)
+	    (return new-constant-queue))))
+
+(defun-simple constant-queue-nth (n constant-queue)
+  (loop for count fixnum = 0 then (+f count 1)
+	for block being each constant-queue-element of constant-queue
+	when (=f count n)
+	do (return block)))

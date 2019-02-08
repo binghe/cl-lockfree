@@ -141,3 +141,34 @@ Atomic Stamp        (#b000000010110001100000000000000000000000000000000000000000
     `(loop as ,old = ,place
 	   as ,new = (-f ,old 1)
 	   until (compare-and-swap ,place ,old ,new))))
+
+(defmacro make-list-element-macro (queue-next-element queue-previous-element queue-datum)
+  `(vector 1 ,queue-next-element ,queue-previous-element ,queue-datum))
+
+(defun make-list-element (queue-next-element queue-previous-element queue-datum)
+  (make-list-element-macro queue-next-element queue-previous-element queue-datum))
+
+(defmacro reclaim-list-element-macro (list-element)
+  (declare (ignore list-element))
+  nil) ; no-op
+
+(defmacro reclaim-list-element (list-element)
+  (reclaim-list-element-macro list-element))
+
+(defmacro reference-count-and-claim-bit (list-element)
+  `(svref ,list-element 0))
+
+(defmacro queue-next-element (list-element)
+  `(svref ,list-element 1))
+
+(defmacro queue-previous-element (list-element)
+  `(svref ,list-element 2))
+
+(defmacro queue-datum (list-element)
+  `(svref ,list-element 3))
+
+(defmacro reference-count (list-element)
+  `(ash (queue-reference-count-and-claim-bit ,list-element) -1))
+
+(defmacro claim-bit (list-element)
+  `(ldb (byte 1 0) (reference-count-and-claim-bit ,list-element)))
